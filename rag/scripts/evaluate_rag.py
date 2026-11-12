@@ -65,7 +65,7 @@ def main():
 
     # Use the supplied dense retriever unless feedback is enabled.
     searcher = (
-        DenseFeedbackRetriever(retriever, feedback_k=3, weight=0.2)
+        DenseFeedbackRetriever(retriever, feedback_k=3, weight=0.05)
         if args.dense_feedback
         else retriever
     )
@@ -112,7 +112,7 @@ def main():
         print(f"  {key:<10} {np.mean([r[key] for r in rows]):.6f}")
 
     # Summarise retrieval latency across all evaluated queries.
-    print(f"  Median query latency: {np.median([r['query_ms'] for r in rows]):.2f} ms")
+    # print(f"  Median query latency: {np.median([r['query_ms'] for r in rows]):.2f} ms")
 
 
 if __name__ == "__main__":
