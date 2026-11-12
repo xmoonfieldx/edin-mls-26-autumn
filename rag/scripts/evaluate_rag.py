@@ -16,6 +16,9 @@ from src.encoder import LocalEncoder
 from src.metrics import recall_at_k, mrr_at_k, ndcg_at_k
 from src.retriever import ExactDenseRetriever
 
+# For Pseudo-relevance feedback implementation
+from time import perf_counter
+from extensions.dense_feedback import DenseFeedbackRetriever
 
 def load_cache(path: Path):
     cache = {}
@@ -43,6 +46,7 @@ def main():
     ap.add_argument("--transcript-cache", type=Path, default=None)
     ap.add_argument("--device", default=None)
     ap.add_argument("--k-max", type=int, default=100)
+    ap.add_argument("--dense-feedback", action="store_true")
     args = ap.parse_args()
     if args.k_max < 100:
         ap.error("--k-max must be at least 100 to report Recall@100")
@@ -59,6 +63,13 @@ def main():
         data_dir / "embeddings" / "corpus_enc_a_ids.json",
     )
 
+    # Use the supplied dense retriever unless feedback is enabled.
+    searcher = (
+        DenseFeedbackRetriever(retriever, feedback_k=3, weight=0.2)
+        if args.dense_feedback
+        else retriever
+    )
+
     cache = load_cache(args.transcript_cache) if args.transcript_cache else {}
 
     rows = []
@@ -73,8 +84,13 @@ def main():
             if args.transcript_cache:
                 append_cache(args.transcript_cache, qid, transcript)
 
+        # Time the full retrieval path from transcript to ranked IDs.
+        # This includes encoding and both searches when feedback is enabled.
+        started = perf_counter()
         qvec = encoder.encode(transcript)
-        ret = retriever.retrieve(qvec, k=args.k_max)
+        ret = searcher.retrieve(qvec, k=args.k_max)
+        query_ms = (perf_counter() - started) * 1000
+
         ranked = ret["record_ids"]
         rel = qrels[qid]
 
@@ -94,6 +110,9 @@ def main():
     print("\nAggregate:")
     for key in keys:
         print(f"  {key:<10} {np.mean([r[key] for r in rows]):.6f}")
+
+    # Summarise retrieval latency across all evaluated queries.
+    print(f"  Median query latency: {np.median([r['query_ms'] for r in rows]):.2f} ms")
 
 
 if __name__ == "__main__":
