@@ -15,6 +15,8 @@ from src.data import CourseData
 from src.encoder import LocalEncoder
 from src.metrics import recall_at_k, mrr_at_k, ndcg_at_k
 from src.retriever import ExactDenseRetriever
+from extensions.asr_rewriting import ASRRewriteRetriever
+from src.generator import ELMGenerator
 
 # For Pseudo-relevance feedback implementation
 from time import perf_counter
@@ -47,6 +49,7 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--k-max", type=int, default=100)
     ap.add_argument("--dense-feedback", action="store_true")
+    ap.add_argument("--asr-rewrite", action="store_true")
     args = ap.parse_args()
     if args.k_max < 100:
         ap.error("--k-max must be at least 100 to report Recall@100")
@@ -70,6 +73,13 @@ def main():
         else retriever
     )
 
+    if args.asr_rewrite and args.dense_feedback:
+        ap.error("Choose either --asr-rewrite or --dense-feedback")
+
+    rewrite_searcher = None
+    if args.asr_rewrite:
+        rewrite_searcher = ASRRewriteRetriever(encoder, retriever, ELMGenerator())
+
     cache = load_cache(args.transcript_cache) if args.transcript_cache else {}
 
     rows = []
@@ -87,10 +97,14 @@ def main():
         # Time the full retrieval path from transcript to ranked IDs.
         # This includes encoding and both searches when feedback is enabled.
         started = perf_counter()
-        qvec = encoder.encode(transcript)
-        ret = searcher.retrieve(qvec, k=args.k_max)
-        query_ms = (perf_counter() - started) * 1000
 
+        if rewrite_searcher is None:
+            qvec = encoder.encode(transcript)
+            ret = searcher.retrieve(qvec, k=args.k_max)
+        else:
+            ret = rewrite_searcher.retrieve(transcript, k=args.k_max)
+
+        query_ms = (perf_counter() - started) * 1000
         ranked = ret["record_ids"]
         rel = qrels[qid]
 
