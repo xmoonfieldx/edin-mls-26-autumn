@@ -17,6 +17,9 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     // ======================== BLANK 2.1 =========================
     // One step of the butterfly sum (see the guide).
     // YOUR CODE HERE
+    
+    v = v + __shfl_xor_sync(FULL_MASK, v, offset);
+
     // ============================================================
   }
   return v;
@@ -28,6 +31,7 @@ __device__ __forceinline__ float warp_reduce_max(float v) {
     // ======================== BLANK 2.2 =========================
     // The same for the maximum.
     // YOUR CODE HERE
+      v = fmaxf(v, __shfl_xor_sync(FULL_MASK, v, offset));
     // ============================================================
   }
   return v;
@@ -61,6 +65,12 @@ __device__ __forceinline__ float block_reduce_max(float v) {
   // ======================== BLANK 2.3 =========================
   // Block-wide maximum, built like block_reduce_sum above.
   // YOUR CODE HERE
+  v = warp_reduce_max(v);
+  if(lane == 0) partial[warp] = v;
+  __syncthreads();
+  v = (lane < num_warps) ? partial[lane] : -INFINITY;
+  v = warp_reduce_max(v);
+  __syncthreads();
   // ============================================================
   return v;
 }
@@ -82,6 +92,27 @@ __device__ __forceinline__ MaxSum maxsum_merge(MaxSum a, MaxSum b) {
   // Merge a and b with the rule in the guide. Merging two empty summaries
   // ({-INFINITY, 0}) must give an empty summary, not NaN.
   // YOUR CODE HERE
+   if(a.m == -INFINITY && b.m == -INFINITY){
+    r.m = -INFINITY;
+    r.l = 0.0f;
+  }
+  else if(a.m == -INFINITY){
+    r.m = b.m;
+    r.l = b.l;
+  }
+  else if(b.m == -INFINITY){
+    r.m = a.m;
+    r.l = a.l;
+  }
+  else {
+      r.m = fmaxf(a.m,b.m);
+      r.l = a.l * expf(a.m - r.m) + b.l * expf(b.m - r.m);
+  }
   // ============================================================
   return r;
 }
+
+
+
+
+
