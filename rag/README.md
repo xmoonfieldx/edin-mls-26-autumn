@@ -178,6 +178,10 @@ ceiling indicates candidate-coverage headroom. These are upper bounds based on
 public qrels, not predicted improvements. Relevant documents outside the pool
 have a null rank. The default pool has 100 records; change it with `--k-max`.
 
+For dense-preserving feature fusion, selective pointwise gating and deeper
+shortlist selection, follow the [experiments 1–3 guide](extensions/RETRIEVAL_FOLLOWUPS.md).
+It provides cached-score pilots, GPU replay commands and explicit ELM call budgets.
+
 ## Step 6: generate and evaluate answers
 
 Begin with five queries so you can inspect the outputs before evaluating a

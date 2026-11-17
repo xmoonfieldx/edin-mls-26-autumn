@@ -3,6 +3,18 @@ import re
 from itertools import combinations
 
 
+POINTWISE_INSTRUCTION = (
+    "Score how directly the single passage answers the query. "
+    "Use 0 for unrelated, 1 for same topic only, "
+    "2 for partially useful, 3 for directly relevant, "
+    "and 4 for directly answering the query. "
+    'Return a JSON object with one integer field, "score". '
+    'For example, if the passage is partially useful, return '
+    '{"score": 2}. Use the score that fits this passage. '
+    "Do not include an explanation."
+)
+
+
 class LLMReranker:
     def __init__(self, data, generator, max_passage_chars: int = 1600):
         self.data = data
@@ -80,14 +92,7 @@ class LLMReranker:
             if strategy == "pointwise":
                 for label in labels:
                     score = self._ask(
-                        "Score how directly the single passage answers the query. "
-                        "Use 0 for unrelated, 1 for same topic only, "
-                        "2 for partially useful, 3 for directly relevant, "
-                        "and 4 for directly answering the query. "
-                        'Return a JSON object with one integer field, "score". '
-                        'For example, if the passage is partially useful, return '
-                        '{"score": 2}. Use the score that fits this passage. '
-                        "Do not include an explanation.",
+                        POINTWISE_INSTRUCTION,
                         transcript,
                         {label: passages[label]},
                         stats,
