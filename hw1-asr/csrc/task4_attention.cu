@@ -133,12 +133,15 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
     // YOUR CODE HERE
     float tile_max = warp_reduce_max(s);
     float m_new = fmaxf(m, tile_max);
-    float corr = (m == -INFINITY)
-                    ? 0.0f
-                    : expf(m - m_new);
-    p = (s == -INFINITY)
-            ? 0.0f
-            : expf(s - m_new);
+    float corr = 0.0f;
+    if (m != -INFINITY) {
+        corr = expf(m - m_new);
+    }
+
+
+    if (s != -INFINITY) {
+        p = expf(s - m_new);
+    }
     float tile_sum = warp_reduce_sum(p);
     l = l * corr + tile_sum;
     for (int i = 0; i < dims; ++i) {
@@ -157,7 +160,6 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
 
       for (int i = 0; i < dims; ++i) {
           int d = lane + i * WARP_SIZE;
-
           acc[i] += pr * v_tile[r * head_dim + d];
       }
     }
