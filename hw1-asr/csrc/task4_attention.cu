@@ -127,7 +127,7 @@ __global__ void attention_kernel(const float* q, const float* k, const float* v,
     // ======================== BLANK 4.4 =========================
     // Update m, l and acc with this tile (guide, section 3) and set p.
     // YOUR CODE HERE
-    global float m_new = block_reduce_max(s);
+    float m_new = block_reduce_max(s);
     float l_new = 0.0f;
     if (m_new > m) {
       l_new = l * expf(m - m_new);
