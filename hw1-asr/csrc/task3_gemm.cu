@@ -52,20 +52,20 @@ __global__ void linear_tiled_kernel(const float* x, const float* w, const float*
 
     if (w_row < N && w_col < K) {
         ws[ty][tx] = w[w_row * K + w_col];
+    } else {
+        ws[ty][tx] = 0.0f;
     }
-      else
-      {
-        ws[tx][ty] = 0.0f;
-      }
     // ============================================================
 
     // ======================== BLANK 3.3 =========================
     // Add this K step's contribution to acc.
     // YOUR CODE HERE
     __syncthreads();
+    
     for(int k = 0; k < TILE; k++){
       acc += xs[ty][k] * ws[tx][k];
     } 
+    __syncthreads();
 
     // ============================================================
   }
