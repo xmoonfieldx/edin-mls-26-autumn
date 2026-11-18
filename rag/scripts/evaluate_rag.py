@@ -50,16 +50,36 @@ def main():
     methods.add_argument("--cross-encoder", action="store_true")
     methods.add_argument("--bm25-rerank", action="store_true")
     methods.add_argument("--hybrid-rrf", action="store_true")
+    methods.add_argument(
+        "--bm25-slots", type=int, choices=(2, 5),
+        help="Reserve up to this many of the first 20 ranks for BM25 hits.",
+    )
+    methods.add_argument(
+        "--hybrid-llm-rerank",
+        action="store_true",
+        help="Fuse dense and BM25 rankings, then rerank the shortlist with pointwise ELM.",
+    )
     methods.add_argument("--llm-rerank", choices=["pointwise", "pairwise", "listwise"])
     methods.add_argument("--export-features", type=Path)
+    methods.add_argument("--dense-feedback", choices=("only", "protect-top10", "rrf"))
+    ap.add_argument("--feedback-k", type=int, default=3)
+    ap.add_argument("--feedback-weight", type=float, default=0.2)
 
     args = ap.parse_args()
+
+    if args.feedback_k < 1:
+        ap.error("--feedback-k must be positive")
+    if not 0.0 <= args.feedback_weight <= 1.0:
+        ap.error("--feedback-weight must be between 0 and 1")
 
     if args.k_max < 100:
         ap.error("--k-max must be at least 100 to report Recall@100")
 
+    uses_hybrid = args.hybrid_rrf or args.hybrid_llm_rerank or args.bm25_slots is not None
+    llm_strategy = "pointwise" if args.hybrid_llm_rerank else args.llm_rerank
+
     uses_shortlist = (
-        args.cross_encoder or args.bm25_rerank or args.llm_rerank
+        args.cross_encoder or args.bm25_rerank or llm_strategy
         or args.export_features is not None
     )
     if uses_shortlist and not 10 <= args.rerank_depth <= args.k_max:
@@ -91,7 +111,7 @@ def main():
         cross_encoder = CrossEncoderReranker(data, device=args.device or "cpu")
 
     bm25 = None
-    if args.bm25_rerank or args.hybrid_rrf or args.export_features is not None:
+    if args.bm25_rerank or uses_hybrid or args.export_features is not None:
         index_started = perf_counter()
         bm25 = BM25Retriever(data.records)
         index_seconds = perf_counter() - index_started
@@ -99,7 +119,7 @@ def main():
 
     llm_reranker = None
     llm_totals = {"requests": 0, "prompt_chars": 0, "invalid_outputs": 0}
-    if args.llm_rerank:
+    if llm_strategy is not None:
         from extensions.llm_reranking import LLMReranker
         from src.generator import ELMGenerator
 
@@ -108,6 +128,13 @@ def main():
     depth = args.rerank_depth
     rows = []
     feature_rows = []
+
+    if args.dense_feedback:
+        row_by_id = {
+            record_id: row for row, record_id in enumerate(retriever.record_ids)
+        }
+    gained_at20 = 0
+    lost_at20 = 0
 
     for i, item in enumerate(items, start=1):
         qid = item["query_id"]
@@ -123,6 +150,36 @@ def main():
         qvec = encoder.encode(transcript)
         ret = retriever.retrieve(qvec, k=args.k_max)
         ranked = ret["record_ids"]
+
+        if args.dense_feedback:
+            dense_ids = ranked
+            seed_ids = dense_ids[:args.feedback_k]
+            seed_rows = [row_by_id[record_id] for record_id in seed_ids]
+            centroid = retriever.embeddings[seed_rows].mean(axis=0)
+            query = np.asarray(qvec, dtype=np.float32).reshape(-1)
+            query = query / np.linalg.norm(query)
+            weight = args.feedback_weight
+            refined = (1 - weight) * query + weight * centroid
+            feedback_ids = retriever.retrieve(refined, k=args.k_max)["record_ids"]
+            if args.dense_feedback == "only":
+                ranked = feedback_ids
+            elif args.dense_feedback == "protect-top10":
+                ranked = list(dict.fromkeys(dense_ids[:10] + feedback_ids))[:args.k_max]
+            else:
+                fused = reciprocal_rank_fusion(dense_ids[:50], feedback_ids[:50], k=20)
+                ranked = list(dict.fromkeys(fused + dense_ids))[:args.k_max]
+
+        if uses_hybrid:
+            lexical_ids = bm25.retrieve(transcript, k=args.k_max)
+            if args.bm25_slots is None:
+                ranked = reciprocal_rank_fusion(ranked, lexical_ids, k=args.k_max)
+            else:
+                prefix = ranked[:20 - args.bm25_slots]
+                bm25_additions = [rid for rid in lexical_ids if rid not in prefix]
+                # Continue in dense order to backfill and retain ranks beyond 20.
+                ranked = list(dict.fromkeys(
+                    prefix + bm25_additions[:args.bm25_slots] + ranked
+                ))[:args.k_max]
 
         llm_stats = None
         if args.export_features is not None:
@@ -148,17 +205,19 @@ def main():
         elif args.bm25_rerank:
             reranked = bm25.rerank(transcript, ranked[:depth])
             ranked = reranked + ranked[depth:]
-        elif args.hybrid_rrf:
-            lexical_ids = bm25.retrieve(transcript, k=args.k_max)
-            ranked = reciprocal_rank_fusion(ranked, lexical_ids, k=args.k_max)
         elif llm_reranker is not None:
             reranked, llm_stats = llm_reranker.rerank(
-                transcript, ranked[:depth], args.llm_rerank
+                transcript, ranked[:depth], llm_strategy
             )
             ranked = reranked + ranked[depth:]
 
         query_ms = (perf_counter() - started) * 1000
         rel = qrels[qid]
+        if args.dense_feedback:
+            dense_hits = set(dense_ids[:20]).intersection(rel)
+            feedback_hits = set(ranked[:20]).intersection(rel)
+            gained_at20 += len(feedback_hits - dense_hits)
+            lost_at20 += len(dense_hits - feedback_hits)
         row = {
             "query_id": qid,
             "query_ms": query_ms,
@@ -180,7 +239,7 @@ def main():
                 llm_totals[key] += llm_stats[key]
             progress += f" ELM calls={llm_stats['requests']}"
             if llm_stats["invalid_outputs"]:
-                progress += " (invalid output, used dense order)"
+                progress += " (invalid output, used pre-rerank order)"
         print(progress)
 
     if args.export_features is not None:
@@ -204,6 +263,8 @@ def main():
         query_times.append(row["query_ms"])
     print(f"  Median query latency: {np.median(query_times):.2f} ms")
 
+    if args.dense_feedback:
+        print(f"  Labelled hits gained/lost vs dense at 20: {gained_at20}/{lost_at20}")
     if llm_reranker is not None:
         print(f"  ELM calls attempted: {llm_totals['requests']}")
         print(f"  Prompt characters sent: {llm_totals['prompt_chars']}")

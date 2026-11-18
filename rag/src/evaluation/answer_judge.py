@@ -216,7 +216,13 @@ class Judge:
                     model=self.model,
                     messages=[
                         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
+                        {"role": "user", "content": (
+                            "Return one compact JSON object containing only "
+                            "correctness, grounding, and completeness. Each "
+                            "value must be an integer from 0 to 4. No explanation.\\n\\n"
+                            "INPUT:\\n" + json.dumps(payload, ensure_ascii=False)
+                            if isinstance(last, json.JSONDecodeError) else prompt
+                        )},
                     ],
                     temperature=0.0,
                 )
