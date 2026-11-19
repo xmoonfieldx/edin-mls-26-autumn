@@ -37,16 +37,44 @@ def append_cache(path: Path, qid: str, transcript: str):
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--split", choices=["practice", "dev"], default="practice")
-    ap.add_argument("--transcript-cache", type=Path, default=None)
-    ap.add_argument("--device", default=None)
-    ap.add_argument("--k-max", type=int, default=100)
-    ap.add_argument("--rerank-depth", type=int, default=20)
-    ap.add_argument("--limit", type=int, default=None)
+def feedback_ranking(query_vector, dense_ids, retriever, row_by_id, args):
+    """Refine the query with the same dense-seed centroid and merge policy."""
+    seed_rows = [row_by_id[record_id] for record_id in dense_ids[:args.feedback_k]]
+    centroid = retriever.embeddings[seed_rows].mean(axis=0)
+    query = np.asarray(query_vector, dtype=np.float32).reshape(-1)
+    query = query / np.linalg.norm(query)
+    weight = args.feedback_weight
+    refined_query = (1 - weight) * query + weight * centroid
+    feedback_ids = retriever.retrieve(refined_query, k=args.k_max)["record_ids"]
 
-    methods = ap.add_mutually_exclusive_group()
+    if args.dense_feedback == "only":
+        return feedback_ids
+    if args.dense_feedback == "protect-top10":
+        return list(dict.fromkeys(dense_ids[:10] + feedback_ids))[:args.k_max]
+    fused_ids = reciprocal_rank_fusion(dense_ids[:50], feedback_ids[:50], k=20)
+    return list(dict.fromkeys(fused_ids + dense_ids))[:args.k_max]
+
+
+def hybrid_ranking(dense_ids, lexical_ids, k_max, bm25_slots):
+    """Fuse both rankings, or reserve the configured lexical slots."""
+    if bm25_slots is None:
+        return reciprocal_rank_fusion(dense_ids, lexical_ids, k=k_max)
+    prefix = dense_ids[:20 - bm25_slots]
+    additions = [record_id for record_id in lexical_ids if record_id not in prefix]
+    # Dense order supplies backfill and the tail after rank 20.
+    return list(dict.fromkeys(prefix + additions[:bm25_slots] + dense_ids))[:k_max]
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", choices=["practice", "dev"], default="practice")
+    parser.add_argument("--transcript-cache", type=Path, default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--k-max", type=int, default=100)
+    parser.add_argument("--rerank-depth", type=int, default=20)
+    parser.add_argument("--limit", type=int, default=None)
+
+    methods = parser.add_mutually_exclusive_group()
     methods.add_argument("--cross-encoder", action="store_true")
     methods.add_argument("--bm25-rerank", action="store_true")
     methods.add_argument("--hybrid-rrf", action="store_true")
@@ -62,18 +90,18 @@ def main():
     methods.add_argument("--llm-rerank", choices=["pointwise", "pairwise", "listwise"])
     methods.add_argument("--export-features", type=Path)
     methods.add_argument("--dense-feedback", choices=("only", "protect-top10", "rrf"))
-    ap.add_argument("--feedback-k", type=int, default=3)
-    ap.add_argument("--feedback-weight", type=float, default=0.2)
+    parser.add_argument("--feedback-k", type=int, default=3)
+    parser.add_argument("--feedback-weight", type=float, default=0.2)
 
-    args = ap.parse_args()
+    args = parser.parse_args()
 
     if args.feedback_k < 1:
-        ap.error("--feedback-k must be positive")
+        parser.error("--feedback-k must be positive")
     if not 0.0 <= args.feedback_weight <= 1.0:
-        ap.error("--feedback-weight must be between 0 and 1")
+        parser.error("--feedback-weight must be between 0 and 1")
 
     if args.k_max < 100:
-        ap.error("--k-max must be at least 100 to report Recall@100")
+        parser.error("--k-max must be at least 100 to report Recall@100")
 
     uses_hybrid = args.hybrid_rrf or args.hybrid_llm_rerank or args.bm25_slots is not None
     llm_strategy = "pointwise" if args.hybrid_llm_rerank else args.llm_rerank
@@ -83,10 +111,10 @@ def main():
         or args.export_features is not None
     )
     if uses_shortlist and not 10 <= args.rerank_depth <= args.k_max:
-        ap.error("--rerank-depth must be between 10 and --k-max")
+        parser.error("--rerank-depth must be between 10 and --k-max")
 
     if args.limit is not None and args.limit < 1:
-        ap.error("--limit must be positive")
+        parser.error("--limit must be positive")
 
     data_dir = ROOT / "data" / "rag_corpus"
     data = CourseData(data_dir)
@@ -94,7 +122,7 @@ def main():
     if args.limit is not None:
         items = items[:args.limit]
     if not items:
-        ap.error(f"No queries found for the {args.split} split")
+        parser.error(f"No queries found for the {args.split} split")
 
     qrels = data.load_qrels(args.split)
     cache = load_cache(args.transcript_cache) if args.transcript_cache else {}
@@ -137,49 +165,27 @@ def main():
     lost_at20 = 0
 
     for i, item in enumerate(items, start=1):
-        qid = item["query_id"]
-        if qid in cache:
-            transcript = cache[qid]
+        query_id = item["query_id"]
+        if query_id in cache:
+            transcript = cache[query_id]
         else:
             audio = data_dir / item["audio_file"]
             transcript = asr.transcribe(audio)
             if args.transcript_cache:
-                append_cache(args.transcript_cache, qid, transcript)
+                append_cache(args.transcript_cache, query_id, transcript)
 
         started = perf_counter()
-        qvec = encoder.encode(transcript)
-        ret = retriever.retrieve(qvec, k=args.k_max)
-        ranked = ret["record_ids"]
+        query_vector = encoder.encode(transcript)
+        retrieval = retriever.retrieve(query_vector, k=args.k_max)
+        ranked = retrieval["record_ids"]
 
         if args.dense_feedback:
             dense_ids = ranked
-            seed_ids = dense_ids[:args.feedback_k]
-            seed_rows = [row_by_id[record_id] for record_id in seed_ids]
-            centroid = retriever.embeddings[seed_rows].mean(axis=0)
-            query = np.asarray(qvec, dtype=np.float32).reshape(-1)
-            query = query / np.linalg.norm(query)
-            weight = args.feedback_weight
-            refined = (1 - weight) * query + weight * centroid
-            feedback_ids = retriever.retrieve(refined, k=args.k_max)["record_ids"]
-            if args.dense_feedback == "only":
-                ranked = feedback_ids
-            elif args.dense_feedback == "protect-top10":
-                ranked = list(dict.fromkeys(dense_ids[:10] + feedback_ids))[:args.k_max]
-            else:
-                fused = reciprocal_rank_fusion(dense_ids[:50], feedback_ids[:50], k=20)
-                ranked = list(dict.fromkeys(fused + dense_ids))[:args.k_max]
+            ranked = feedback_ranking(query_vector, dense_ids, retriever, row_by_id, args)
 
         if uses_hybrid:
             lexical_ids = bm25.retrieve(transcript, k=args.k_max)
-            if args.bm25_slots is None:
-                ranked = reciprocal_rank_fusion(ranked, lexical_ids, k=args.k_max)
-            else:
-                prefix = ranked[:20 - args.bm25_slots]
-                bm25_additions = [rid for rid in lexical_ids if rid not in prefix]
-                # Continue in dense order to backfill and retain ranks beyond 20.
-                ranked = list(dict.fromkeys(
-                    prefix + bm25_additions[:args.bm25_slots] + ranked
-                ))[:args.k_max]
+            ranked = hybrid_ranking(ranked, lexical_ids, args.k_max, args.bm25_slots)
 
         llm_stats = None
         if args.export_features is not None:
@@ -190,7 +196,7 @@ def main():
 
             candidates = []
             for record_id, dense_score in zip(
-                candidate_ids, ret["scores"][:depth], strict=True
+                candidate_ids, retrieval["scores"][:depth], strict=True
             ):
                 candidates.append({
                     "record_id": record_id,
@@ -198,7 +204,7 @@ def main():
                     "bm25": lexical_scores[record_id],
                     "cross": cross_scores[record_id],
                 })
-            feature_rows.append({"query_id": qid, "candidates": candidates})
+            feature_rows.append({"query_id": query_id, "candidates": candidates})
         elif cross_encoder is not None:
             reranked = cross_encoder.rerank(transcript, ranked[:depth])
             ranked = reranked + ranked[depth:]
@@ -212,26 +218,26 @@ def main():
             ranked = reranked + ranked[depth:]
 
         query_ms = (perf_counter() - started) * 1000
-        rel = qrels[qid]
+        relevance = qrels[query_id]
         if args.dense_feedback:
-            dense_hits = set(dense_ids[:20]).intersection(rel)
-            feedback_hits = set(ranked[:20]).intersection(rel)
+            dense_hits = set(dense_ids[:20]).intersection(relevance)
+            feedback_hits = set(ranked[:20]).intersection(relevance)
             gained_at20 += len(feedback_hits - dense_hits)
             lost_at20 += len(dense_hits - feedback_hits)
         row = {
-            "query_id": qid,
+            "query_id": query_id,
             "query_ms": query_ms,
-            "Recall@5": recall_at_k(ranked, rel, 5),
-            "Recall@10": recall_at_k(ranked, rel, 10),
-            "Recall@20": recall_at_k(ranked, rel, 20),
-            "Recall@100": recall_at_k(ranked, rel, 100),
-            "MRR@10": mrr_at_k(ranked, rel, 10),
-            "NDCG@10": ndcg_at_k(ranked, rel, 10),
+            "Recall@5": recall_at_k(ranked, relevance, 5),
+            "Recall@10": recall_at_k(ranked, relevance, 10),
+            "Recall@20": recall_at_k(ranked, relevance, 20),
+            "Recall@100": recall_at_k(ranked, relevance, 100),
+            "MRR@10": mrr_at_k(ranked, relevance, 10),
+            "NDCG@10": ndcg_at_k(ranked, relevance, 10),
         }
         rows.append(row)
 
         progress = (
-            f"[{i:>3}/{len(items)}] {qid} "
+            f"[{i:>3}/{len(items)}] {query_id} "
             f"R@5={row['Recall@5']:.3f} R@10={row['Recall@10']:.3f}"
         )
         if llm_stats is not None:
@@ -253,14 +259,10 @@ def main():
     keys = ["Recall@5", "Recall@10", "Recall@20", "Recall@100", "MRR@10", "NDCG@10"]
     print("\nAggregate:")
     for key in keys:
-        values = []
-        for row in rows:
-            values.append(row[key])
+        values = [row[key] for row in rows]
         print(f"  {key:<10} {np.mean(values):.6f}")
 
-    query_times = []
-    for row in rows:
-        query_times.append(row["query_ms"])
+    query_times = [row["query_ms"] for row in rows]
     print(f"  Median query latency: {np.median(query_times):.2f} ms")
 
     if args.dense_feedback:

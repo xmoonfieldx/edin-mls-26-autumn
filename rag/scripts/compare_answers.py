@@ -19,45 +19,62 @@ def load(path):
     return rows
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("answers_a")
-    ap.add_argument("answers_b")
-    ap.add_argument("judge_a")
-    ap.add_argument("judge_b")
-    ap.add_argument("--k", type=int, default=5)
-    args = ap.parse_args()
+def bootstrap_interval(score_differences):
+    """Resample paired query differences with the original seed and draw order."""
+    rng = np.random.default_rng(0)
+    query_count = len(score_differences)
+    bootstrap_means = [
+        score_differences[rng.integers(0, query_count, query_count)].mean()
+        for _ in range(10000)
+    ]
+    return np.percentile(bootstrap_means, [2.5, 97.5])
 
-    a, b = load(args.answers_a), load(args.answers_b)
-    sa = load(Path(args.judge_a) / "answer_judge_per_query.jsonl")
-    sb = load(Path(args.judge_b) / "answer_judge_per_query.jsonl")
-    qids = sorted(set(a) & set(b) & set(sa) & set(sb))
-    if not qids:
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("answers_a")
+    parser.add_argument("answers_b")
+    parser.add_argument("judge_a")
+    parser.add_argument("judge_b")
+    parser.add_argument("--k", type=int, default=5)
+    args = parser.parse_args()
+
+    answers_a, answers_b = load(args.answers_a), load(args.answers_b)
+    judgements_a = load(Path(args.judge_a) / "answer_judge_per_query.jsonl")
+    judgements_b = load(Path(args.judge_b) / "answer_judge_per_query.jsonl")
+    query_ids = sorted(set(answers_a) & set(answers_b) & set(judgements_a) & set(judgements_b))
+    if not query_ids:
         raise SystemExit("No queries are present in all four files")
 
-    same_transcript = sum(a[q]["transcript"] == b[q]["transcript"] for q in qids)
-    diffs, changed = [], []
-    for q in qids:
-        diffs.append(sb[q]["normalised_answer_score"] - sa[q]["normalised_answer_score"])
-        changed.append(set(a[q]["retrieved_record_ids"][:args.k])
-                       != set(b[q]["retrieved_record_ids"][:args.k]))
-    diffs, changed = np.array(diffs), np.array(changed)
+    same_transcript = sum(
+        answers_a[query_id]["transcript"] == answers_b[query_id]["transcript"]
+        for query_id in query_ids
+    )
+    score_differences, evidence_changed = [], []
+    for query_id in query_ids:
+        score_differences.append(
+            judgements_b[query_id]["normalised_answer_score"]
+            - judgements_a[query_id]["normalised_answer_score"]
+        )
+        evidence_changed.append(
+            set(answers_a[query_id]["retrieved_record_ids"][:args.k])
+            != set(answers_b[query_id]["retrieved_record_ids"][:args.k])
+        )
+    score_differences, evidence_changed = np.array(score_differences), np.array(evidence_changed)
 
-    rng = np.random.default_rng(0)
-    boots = [diffs[rng.integers(0, len(diffs), len(diffs))].mean() for _ in range(10000)]
-    lo, hi = np.percentile(boots, [2.5, 97.5])
+    lower_bound, upper_bound = bootstrap_interval(score_differences)
 
-    print(f"Queries compared: {len(qids)}  (same transcript in {same_transcript})")
-    print(f"Mean answer score  A: {np.mean([sa[q]['normalised_answer_score'] for q in qids]):.4f}"
-          f"   B: {np.mean([sb[q]['normalised_answer_score'] for q in qids]):.4f}")
-    print(f"Mean B - A over all queries: {diffs.mean():+.4f}  (95% bootstrap CI {lo:+.4f} to {hi:+.4f})")
-    print(f"Queries whose top-{args.k} evidence set differs: {int(changed.sum())}")
-    if changed.any():
-        d = diffs[changed]
-        print(f"  among those: mean {d.mean():+.4f}, B better {(d > 0).sum()}, "
-              f"worse {(d < 0).sum()}, equal {(d == 0).sum()}")
-    if (~changed).any():
-        print(f"  unchanged evidence: mean {diffs[~changed].mean():+.4f} "
+    print(f"Queries compared: {len(query_ids)}  (same transcript in {same_transcript})")
+    print(f"Mean answer score  A: {np.mean([judgements_a[query_id]['normalised_answer_score'] for query_id in query_ids]):.4f}"
+          f"   B: {np.mean([judgements_b[query_id]['normalised_answer_score'] for query_id in query_ids]):.4f}")
+    print(f"Mean B - A over all queries: {score_differences.mean():+.4f}  (95% bootstrap CI {lower_bound:+.4f} to {upper_bound:+.4f})")
+    print(f"Queries whose top-{args.k} evidence set differs: {int(evidence_changed.sum())}")
+    if evidence_changed.any():
+        changed_differences = score_differences[evidence_changed]
+        print(f"  among those: mean {changed_differences.mean():+.4f}, B better {(changed_differences > 0).sum()}, "
+              f"worse {(changed_differences < 0).sum()}, equal {(changed_differences == 0).sum()}")
+    if (~evidence_changed).any():
+        print(f"  unchanged evidence: mean {score_differences[~evidence_changed].mean():+.4f} "
               f"(generation/judge noise only)")
 
 

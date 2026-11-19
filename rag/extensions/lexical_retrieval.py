@@ -10,6 +10,8 @@ def tokenize(text: str) -> list[str]:
 
 
 class BM25Retriever:
+    """Use corpus-wide BM25 statistics for search or shortlist reranking."""
+
     def __init__(self, records: dict[str, str], k1: float = 1.2, b: float = 0.75):
         self.k1 = k1
         self.b = b
@@ -55,7 +57,7 @@ class BM25Retriever:
     def score_candidates(
         self, transcript: str, candidate_ids: list[str]
     ) -> dict[str, float]:
-        # Use corpus-wide statistics and give unmatched candidates a zero score.
+        # Unmatched terms contribute zero under BM25.
         scores = dict.fromkeys(candidate_ids, 0.0)
         for term in dict.fromkeys(tokenize(transcript)):
             posting = self.postings.get(term, {})
@@ -70,7 +72,7 @@ class BM25Retriever:
         return sorted(candidate_ids, key=scores.__getitem__, reverse=True)
 
     def retrieve(self, transcript: str, k: int = 100) -> list[str]:
-        # The postings let us find matches anywhere in the corpus.
+        # Search all matching corpus postings, not just a dense shortlist.
         scores = defaultdict(float)
         for term in dict.fromkeys(tokenize(transcript)):
             for record_id, frequency in self.postings.get(term, {}).items():

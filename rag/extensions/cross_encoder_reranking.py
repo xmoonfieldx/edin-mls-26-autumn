@@ -1,4 +1,6 @@
 class CrossEncoderReranker:
+    """Score query–passage pairs with the same local MiniLM model."""
+
     def __init__(self, data, device: str = "cpu", batch_size: int = 16):
         from sentence_transformers import CrossEncoder
 
@@ -15,10 +17,7 @@ class CrossEncoderReranker:
         if not candidate_ids:
             return {}
 
-        pairs = []
-        for record_id in candidate_ids:
-            passage = self.data.record_text(record_id)
-            pairs.append((transcript, passage))
+        pairs = [(transcript, self.data.record_text(record_id)) for record_id in candidate_ids]
 
         scores = self.model.predict(
             pairs,
@@ -26,12 +25,10 @@ class CrossEncoderReranker:
             show_progress_bar=False,
         )
 
-        scores_by_id = {}
-        for record_id, score in zip(candidate_ids, scores, strict=True):
-            scores_by_id[record_id] = float(score)
-        return scores_by_id
+        return {record_id: float(score)
+                for record_id, score in zip(candidate_ids, scores, strict=True)}
 
     def rerank(self, transcript: str, candidate_ids: list[str]) -> list[str]:
         scores = self.score_candidates(transcript, candidate_ids)
-        # Stable sorting preserves dense order when scores tie.
+        # Equal scores keep the incoming candidate order.
         return sorted(candidate_ids, key=scores.__getitem__, reverse=True)

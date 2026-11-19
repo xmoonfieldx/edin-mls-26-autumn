@@ -17,21 +17,21 @@ from src.metrics import recall_at_k, mrr_at_k, ndcg_at_k
 
 def diagnose(query_id, transcript, retrieval, relevance, data):
     """Compare a candidate ranking with public qrels; no model inference here."""
-    ranked = retrieval["record_ids"]
-    ranks = {rid: rank for rank, rid in enumerate(ranked, start=1)}
-    hits = len(set(ranked).intersection(relevance))
-    count = len(relevance)
-    if not count:
+    ranked_ids = retrieval["record_ids"]
+    ranks = {record_id: rank for rank, record_id in enumerate(ranked_ids, start=1)}
+    relevant_hits = len(set(ranked_ids).intersection(relevance))
+    relevant_count = len(relevance)
+    if not relevant_count:
         raise ValueError(f"{query_id}: no positive relevance judgements")
-    metrics = {f"Recall@{k}": recall_at_k(ranked, relevance, k)
+    metrics = {f"Recall@{k}": recall_at_k(ranked_ids, relevance, k)
                for k in (5, 10, 20, 100)}
-    metrics.update({"MRR@10": mrr_at_k(ranked, relevance, 10),
-                    "NDCG@10": ndcg_at_k(ranked, relevance, 10)})
-    oracle5 = min(5, hits) / count
-    ceiling5 = min(5, count) / count
+    metrics.update({"MRR@10": mrr_at_k(ranked_ids, relevance, 10),
+                    "NDCG@10": ndcg_at_k(ranked_ids, relevance, 10)})
+    candidate_oracle = min(5, relevant_hits) / relevant_count
+    recall5_ceiling = min(5, relevant_count) / relevant_count
     # This is an upper bound on improvement, not a reranker's predicted score.
-    reranking_gain = oracle5 - metrics["Recall@5"]
-    candidate_gap = ceiling5 - oracle5
+    reranking_gain = candidate_oracle - metrics["Recall@5"]
+    candidate_gap = recall5_ceiling - candidate_oracle
     if reranking_gain > 1e-12 and candidate_gap > 1e-12:
         opportunity = "ranking_and_candidate_coverage"
     elif reranking_gain > 1e-12:
@@ -46,26 +46,26 @@ def diagnose(query_id, transcript, retrieval, relevance, data):
         "metrics": metrics,
         "r10_candidate": metrics["Recall@10"] < 1.0,
         "r5_candidate": metrics["Recall@5"] < 1.0,
-        "relevant_count": count,
-        "relevant_in_candidates": hits,
-        "relevant_missing_from_candidates": count - hits,
-        "candidate_count": len(ranked),
-        "max_possible_recall5": ceiling5,
-        "oracle_recall5_from_candidates": oracle5,
+        "relevant_count": relevant_count,
+        "relevant_in_candidates": relevant_hits,
+        "relevant_missing_from_candidates": relevant_count - relevant_hits,
+        "candidate_count": len(ranked_ids),
+        "max_possible_recall5": recall5_ceiling,
+        "oracle_recall5_from_candidates": candidate_oracle,
         "potential_reranking_gain_at5": reranking_gain,
         "candidate_coverage_gap_at5": candidate_gap,
         "opportunity": opportunity,
         "retrieval_ms": retrieval["latency_ms"],
         "relevant_documents": [
-            {"record_id": rid, "relevance": grade, "rank": ranks.get(rid),
-             "text": data.record_text(rid)}
-            for rid, grade in sorted(relevance.items(), key=lambda x: (-x[1], x[0]))
+            {"record_id": record_id, "relevance": grade, "rank": ranks.get(record_id),
+             "text": data.record_text(record_id)}
+            for record_id, grade in sorted(relevance.items(), key=lambda x: (-x[1], x[0]))
         ],
         "retrieved_documents": [
-            {"rank": rank, "record_id": rid, "score": score,
-             "relevance": relevance.get(rid, 0), "text": data.record_text(rid)}
-            for rank, (rid, score) in enumerate(
-                zip(ranked, retrieval["scores"]), start=1)
+            {"rank": rank, "record_id": record_id, "score": score,
+             "relevance": relevance.get(record_id, 0), "text": data.record_text(record_id)}
+            for rank, (record_id, score) in enumerate(
+                zip(ranked_ids, retrieval["scores"]), start=1)
         ],
     }
 
@@ -134,20 +134,20 @@ def save_reports(out_dir, rows, split, k_max, cache_path, cache_only, report_lim
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--split", choices=["practice", "dev"], default="practice")
-    ap.add_argument("--transcript-cache", type=Path, required=True)
-    ap.add_argument("--cache-only", action="store_true",
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--split", choices=["practice", "dev"], default="practice")
+    parser.add_argument("--transcript-cache", type=Path, required=True)
+    parser.add_argument("--cache-only", action="store_true",
                     help="Require all transcripts in cache; never start ASR (no GPU needed with --device cpu)")
-    ap.add_argument("--device", default=None, help="Query encoder device")
-    ap.add_argument("--k-max", type=int, default=100)
-    ap.add_argument("--out-dir", type=Path, required=True, help="New output directory")
-    ap.add_argument("--report-limit", type=int, default=20, help="Queries shown in report.md; all are saved in JSONL/CSV")
-    args = ap.parse_args()
+    parser.add_argument("--device", default=None, help="Query encoder device")
+    parser.add_argument("--k-max", type=int, default=100)
+    parser.add_argument("--out-dir", type=Path, required=True, help="New output directory")
+    parser.add_argument("--report-limit", type=int, default=20, help="Queries shown in report.md; all are saved in JSONL/CSV")
+    args = parser.parse_args()
     if args.k_max < 100 or args.report_limit < 1:
-        ap.error("--k-max must be at least 100; --report-limit must be positive")
+        parser.error("--k-max must be at least 100; --report-limit must be positive")
     if args.out_dir.exists():
-        ap.error("Output directory exists; choose a new directory to preserve prior results")
+        parser.error("Output directory exists; choose a new directory to preserve prior results")
     cache = {}
     if args.transcript_cache.exists():
         for line in args.transcript_cache.read_text(encoding="utf-8").splitlines():
@@ -159,11 +159,11 @@ def main():
     items = data.audio_items(args.split)
     qrels = data.load_qrels(args.split)
     if not items:
-        ap.error("Selected split has no audio queries")
-    missing = [i["query_id"] for i in items if not isinstance(cache.get(i["query_id"]), str)
+        parser.error("Selected split has no audio queries")
+    missing_transcripts = [i["query_id"] for i in items if not isinstance(cache.get(i["query_id"]), str)
                or not cache[i["query_id"]].strip()]
-    if args.cache_only and missing:
-        ap.error(f"Cache is missing {len(missing)} nonempty transcripts; first: {missing[0]}. "
+    if args.cache_only and missing_transcripts:
+        parser.error(f"Cache is missing {len(missing_transcripts)} nonempty transcripts; first: {missing_transcripts[0]}. "
                  "Use the original cache or omit --cache-only to transcribe missing queries.")
     from src.asr_adapter import ASRAdapter
     from src.encoder import LocalEncoder
@@ -178,16 +178,16 @@ def main():
             (args.out_dir / "queries.jsonl").open("x", encoding="utf-8") as all_file, \
             (args.out_dir / "r10_candidates.jsonl").open("x", encoding="utf-8") as candidates_file:
         for i, item in enumerate(items, start=1):
-            qid = item["query_id"]
-            if qid in missing:
+            query_id = item["query_id"]
+            if query_id in missing_transcripts:
                 transcript = asr.transcribe(data_dir / item["audio_file"])
                 args.transcript_cache.parent.mkdir(parents=True, exist_ok=True)
                 with args.transcript_cache.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps({"query_id": qid, "transcript": transcript}, ensure_ascii=False) + "\n")
-                cache[qid] = transcript
-            transcript = cache[qid]
+                    f.write(json.dumps({"query_id": query_id, "transcript": transcript}, ensure_ascii=False) + "\n")
+                cache[query_id] = transcript
+            transcript = cache[query_id]
             retrieval = retriever.retrieve(encoder.encode(transcript), k=args.k_max)
-            row = diagnose(qid, transcript, retrieval, qrels[qid], data)
+            row = diagnose(query_id, transcript, retrieval, qrels[query_id], data)
             row.update({"split": args.split, "audio_file": item["audio_file"]})
             rows.append(row)
             encoded = json.dumps(row, ensure_ascii=False) + "\n"
@@ -196,7 +196,7 @@ def main():
             if row["r10_candidate"]:
                 candidates_file.write(encoded)
                 candidates_file.flush()
-            print(f"[{i:>3}/{len(items)}] {qid} "
+            print(f"[{i:>3}/{len(items)}] {query_id} "
                   f"R@5={row['metrics']['Recall@5']:.3f} "
                   f"R@10={row['metrics']['Recall@10']:.3f} "
                   f"R@100={row['metrics']['Recall@100']:.3f} {row['opportunity']}", flush=True)

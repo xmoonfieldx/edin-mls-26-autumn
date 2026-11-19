@@ -23,10 +23,10 @@ def load_jsonl(path):
 def unique_rows(rows):
     result = {}
     for row in rows:
-        qid = row["query_id"]
-        if qid in result:
-            raise ValueError(f"Duplicate query ID: {qid}")
-        result[qid] = row
+        query_id = row["query_id"]
+        if query_id in result:
+            raise ValueError(f"Duplicate query ID: {query_id}")
+        result[query_id] = row
     return result
 
 
@@ -34,11 +34,11 @@ def validate_features(rows, minimum=20):
     unique_rows(rows)
     for row in rows:
         candidates = row["candidates"]
-        ids = [c["record_id"] for c in candidates]
-        if len(ids) < minimum or len(set(ids)) != len(ids):
+        candidate_ids = [candidate["record_id"] for candidate in candidates]
+        if len(candidate_ids) < minimum or len(set(candidate_ids)) != len(candidate_ids):
             raise ValueError(f"{row['query_id']}: need at least {minimum} unique candidates")
-        for c in candidates:
-            if not all(np.isfinite(c[k]) for k in ("dense", "cross", "bm25")):
+        for candidate in candidates:
+            if not all(np.isfinite(candidate[k]) for k in ("dense", "cross", "bm25")):
                 raise ValueError(f"{row['query_id']}: nonfinite feature")
         if any(a["dense"] < b["dense"] for a, b in zip(candidates, candidates[1:])):
             raise ValueError(f"{row['query_id']}: candidates must be in dense order")
@@ -53,30 +53,41 @@ def folds(rows, count=5, seed=17):
 
 def design(candidates):
     """Within-query min/max scaling needs no fitted statistics or labels."""
-    raw = np.asarray([[c[k] for k in ("dense", "cross", "bm25")] for c in candidates])
-    span = np.ptp(raw, axis=0)
-    scaled = (raw - raw.min(axis=0)) / np.where(span > 0, span, 1)
-    prior = np.linspace(1, 0, len(candidates))
-    return np.column_stack([scaled, prior])
+    raw_scores = np.asarray([[c[k] for k in ("dense", "cross", "bm25")] for c in candidates])
+    score_ranges = np.ptp(raw_scores, axis=0)
+    normalised_scores = (raw_scores - raw_scores.min(axis=0)) / np.where(
+        score_ranges > 0, score_ranges, 1
+    )
+    dense_rank_prior = np.linspace(1, 0, len(candidates))
+    return np.column_stack([normalised_scores, dense_rank_prior])
 
 
 def fit_fusion(rows, training_qrels, depth, ridge, protect):
-    prior = np.asarray([0., 0., 0., 1.])
-    lhs, rhs = ridge * np.eye(4), ridge * prior
-    informative = 0
+    dense_rank_prior = np.asarray([0., 0., 0., 1.])
+    normal_matrix, target_vector = ridge * np.eye(4), ridge * dense_rank_prior
+    informative_queries = 0
     for row in rows:
-        cs = row["candidates"][:depth]
-        x = design(cs)
+        candidates = row["candidates"][:depth]
+        features = design(candidates)
         # Unjudged records are training contrasts, not verified negatives.
-        positive = [i for i, c in enumerate(cs) if c["record_id"] in training_qrels[row["query_id"]]]
-        other = [i for i, c in enumerate(cs) if c["record_id"] not in training_qrels[row["query_id"]]]
-        if positive and other:
-            differences = (x[positive, None, :] - x[None, other, :]).reshape(-1, 4)
-            lhs += differences.T @ differences / len(differences)
-            rhs += differences.mean(axis=0)
-            informative += 1
-    return {"weights": np.linalg.solve(lhs, rhs).tolist(), "ridge": ridge,
-            "protect": protect, "depth": depth, "informative_training_queries": informative,
+        positive_indices = [
+            i for i, candidate in enumerate(candidates)
+            if candidate["record_id"] in training_qrels[row["query_id"]]
+        ]
+        unjudged_indices = [
+            i for i, candidate in enumerate(candidates)
+            if candidate["record_id"] not in training_qrels[row["query_id"]]
+        ]
+        if not positive_indices or not unjudged_indices:
+            continue
+        differences = (
+            features[positive_indices, None, :] - features[None, unjudged_indices, :]
+        ).reshape(-1, 4)
+        normal_matrix += differences.T @ differences / len(differences)
+        target_vector += differences.mean(axis=0)
+        informative_queries += 1
+    return {"weights": np.linalg.solve(normal_matrix, target_vector).tolist(), "ridge": ridge,
+            "protect": protect, "depth": depth, "informative_training_queries": informative_queries,
             "training_queries_sha256": fingerprint(sorted(r["query_id"] for r in rows))}
 
 
@@ -113,35 +124,40 @@ def select_fusion(rows, training_qrels, depth, seed):
     options = [(ridge, protect) for ridge in (.1, 1., 10.) for protect in (0, 2)]
     if len(rows) < 2:
         return fit_fusion(rows, training_qrels, depth, 10., 0)
-    assignment = folds(rows, min(3, len(rows)), seed)
-    best = None
+    fold_by_query = folds(rows, min(3, len(rows)), seed)
+    best_option = None
     for ridge, protect in options:
-        scores = []
-        for fold in sorted(set(assignment.values())):
-            train = [r for r in rows if assignment[r["query_id"]] != fold]
-            validation = [r for r in rows if assignment[r["query_id"]] == fold]
-            policy = fit_fusion(train, {r["query_id"]: training_qrels[r["query_id"]] for r in train},
-                                depth, ridge, protect)
-            scores += [metrics(rank_fusion(r["candidates"], policy)[0], training_qrels[r["query_id"]])
-                       for r in validation]
-        key = (np.mean([s["Recall@5"] for s in scores]),
-               np.mean([s["Recall@10"] for s in scores]), ridge, -protect)
-        if best is None or key > best[0]:
-            best = (key, ridge, protect)
-    result = fit_fusion(rows, training_qrels, depth, best[1], best[2])
-    result["inner_cv_recall5"] = float(best[0][0])
+        validation_metrics = []
+        for fold in sorted(set(fold_by_query.values())):
+            training_rows = [r for r in rows if fold_by_query[r["query_id"]] != fold]
+            validation_rows = [r for r in rows if fold_by_query[r["query_id"]] == fold]
+            fold_qrels = {row["query_id"]: training_qrels[row["query_id"]] for row in training_rows}
+            policy = fit_fusion(training_rows, fold_qrels, depth, ridge, protect)
+            validation_metrics += [
+                metrics(rank_fusion(row["candidates"], policy)[0], training_qrels[row["query_id"]])
+                for row in validation_rows
+            ]
+        selection_key = (
+            np.mean([score["Recall@5"] for score in validation_metrics]),
+            np.mean([score["Recall@10"] for score in validation_metrics]),
+            ridge, -protect,
+        )
+        if best_option is None or selection_key > best_option[0]:
+            best_option = (selection_key, ridge, protect)
+    result = fit_fusion(rows, training_qrels, depth, best_option[1], best_option[2])
+    result["inner_cv_recall5"] = float(best_option[0][0])
     return result
 
 
 def query_features(candidates, feature_set="dense"):
-    cs = candidates[:20]
-    values = {"gap5_6": cs[4]["dense"] - cs[5]["dense"],
-              "gap1_2": cs[0]["dense"] - cs[1]["dense"]}
+    candidates_top20 = candidates[:20]
+    values = {"gap5_6": candidates_top20[4]["dense"] - candidates_top20[5]["dense"],
+              "gap1_2": candidates_top20[0]["dense"] - candidates_top20[1]["dense"]}
     if feature_set == "all":
-        dense5 = {c["record_id"] for c in cs[:5]}
+        dense_top5 = {c["record_id"] for c in candidates_top20[:5]}
         for name in ("cross", "bm25"):
-            top = sorted(range(len(cs)), key=lambda i: (-cs[i][name], i))[:5]
-            values[name + "_disagreement"] = 1 - len(dense5 & {cs[i]["record_id"] for i in top}) / 5
+            top_indices = sorted(range(len(candidates_top20)), key=lambda i: (-candidates_top20[i][name], i))[:5]
+            values[name + "_disagreement"] = 1 - len(dense_top5 & {candidates_top20[i]["record_id"] for i in top_indices}) / 5
     return values
 
 
@@ -167,35 +183,39 @@ def call_pointwise(candidates, policy):
     if policy["kind"] != "threshold":
         return policy["kind"] == "always"
     value = query_features(candidates, policy["feature_set"])[policy["feature"]]
-    return value <= policy["threshold"] if policy["direction"] == "le" else value >= policy["threshold"]
+    if policy["direction"] == "le":
+        return value <= policy["threshold"]
+    return value >= policy["threshold"]
 
 
 def select_gate(rows, outcomes, feature_set, call_fraction, seed):
     if len(rows) < 2:
         return fit_gate(rows, {"kind": "never"}, feature_set)
-    assignment = folds(rows, min(3, len(rows)), seed)
-    best = None
+    fold_by_query = folds(rows, min(3, len(rows)), seed)
+    best_option = None
     for option in gate_options(feature_set):
-        selected = []
-        scores = []
-        for fold in sorted(set(assignment.values())):
-            train = [r for r in rows if assignment[r["query_id"]] != fold]
-            policy = fit_gate(train, option, feature_set)
-            for row in rows:
-                if assignment[row["query_id"]] != fold:
-                    continue
-                use = call_pointwise(row["candidates"], policy)
-                selected.append(use)
-                scores.append(outcomes[row["query_id"]]["pointwise" if use else "dense"])
-        rate = float(np.mean(selected))
+        selection_flags = []
+        validation_outcomes = []
+        for fold in sorted(set(fold_by_query.values())):
+            training_rows = [r for r in rows if fold_by_query[r["query_id"]] != fold]
+            policy = fit_gate(training_rows, option, feature_set)
+            validation_rows = [row for row in rows if fold_by_query[row["query_id"]] == fold]
+            for row in validation_rows:
+                use_pointwise = call_pointwise(row["candidates"], policy)
+                selection_flags.append(use_pointwise)
+                validation_outcomes.append(outcomes[row["query_id"]]["pointwise" if use_pointwise else "dense"])
+        rate = float(np.mean(selection_flags))
         if rate > call_fraction + 1e-12:
             continue
-        key = (np.mean([s["Recall@5"] for s in scores]),
-               np.mean([s["Recall@10"] for s in scores]), -rate)
-        if best is None or key > best[0]:
-            best = (key, option)
-    policy = fit_gate(rows, best[1], feature_set)
-    policy["inner_cv_recall5"] = float(best[0][0])
+        selection_key = (
+            np.mean([score["Recall@5"] for score in validation_outcomes]),
+            np.mean([score["Recall@10"] for score in validation_outcomes]),
+            -rate,
+        )
+        if best_option is None or selection_key > best_option[0]:
+            best_option = (selection_key, option)
+    policy = fit_gate(rows, best_option[1], feature_set)
+    policy["inner_cv_recall5"] = float(best_option[0][0])
     return policy
 
 
@@ -205,18 +225,18 @@ def pointwise_log_outcomes(path, rows, qrels):
     by_id = unique_rows([{"query_id": q, "r5": float(a), "r10": float(b)} for q, a, b in matches])
     outcomes = {}
     for row in rows:
-        qid = row["query_id"]
-        if qid not in by_id:
-            raise ValueError(f"Pointwise log missing {qid}")
-        n = len(qrels[qid])
+        query_id = row["query_id"]
+        if query_id not in by_id:
+            raise ValueError(f"Pointwise log missing {query_id}")
+        relevant_count = len(qrels[query_id])
         pointwise = {"MRR@10": None}
         for k in (5, 10):
-            logged = by_id[qid][f"r{k}"]
-            hits = round(logged * n)
-            if abs(logged - hits / n) > .000501 or hits > min(k, n):
-                raise ValueError(f"Invalid rounded recall for {qid}")
-            pointwise[f"Recall@{k}"] = hits / n
-        outcomes[qid] = {"dense": metrics([c["record_id"] for c in row["candidates"][:20]], qrels[qid]),
+            logged_recall = by_id[query_id][f"r{k}"]
+            relevant_hits = round(logged_recall * relevant_count)
+            if abs(logged_recall - relevant_hits / relevant_count) > .000501 or relevant_hits > min(k, relevant_count):
+                raise ValueError(f"Invalid rounded recall for {query_id}")
+            pointwise[f"Recall@{k}"] = relevant_hits / relevant_count
+        outcomes[query_id] = {"dense": metrics([c["record_id"] for c in row["candidates"][:20]], qrels[query_id]),
                          "pointwise": pointwise}
     return outcomes
 
@@ -224,12 +244,12 @@ def pointwise_log_outcomes(path, rows, qrels):
 def shortlist(candidates):
     if len(candidates) < 40:
         raise ValueError("Deeper selection requires dense top 40")
-    tail = sorted(enumerate(candidates[10:40], start=10), key=lambda pair: (-pair[1]["cross"], pair[0]))
-    chosen = {c["record_id"] for c in candidates[:10]} | {c["record_id"] for _, c in tail[:10]}
+    ranked_tail = sorted(enumerate(candidates[10:40], start=10), key=lambda pair: (-pair[1]["cross"], pair[0]))
+    selected_ids = {c["record_id"] for c in candidates[:10]} | {c["record_id"] for _, c in ranked_tail[:10]}
     # Preserve original dense order, including for ordinal pointwise score ties.
-    ids = [c["record_id"] for c in candidates[:40] if c["record_id"] in chosen]
-    assert len(ids) == len(set(ids)) == 20
-    return ids
+    shortlist_ids = [c["record_id"] for c in candidates[:40] if c["record_id"] in selected_ids]
+    assert len(shortlist_ids) == len(set(shortlist_ids)) == 20
+    return shortlist_ids
 
 
 def candidate_report(ids, rel, dense20):
@@ -240,19 +260,32 @@ def candidate_report(ids, rel, dense20):
             "lost_relevant_ids": sorted((set(dense20) - set(ids)) & set(rel))}
 
 
+def paired_comparison(deltas):
+    """Summarise paired query differences with the original bootstrap draws."""
+    rng = np.random.default_rng(17)
+    samples = rng.choice(deltas, (2000, len(deltas)), replace=True).mean(axis=1)
+    return {
+        "mean_delta": float(deltas.mean()),
+        "wins": int((deltas > 1e-12).sum()),
+        "losses": int((deltas < -1e-12).sum()),
+        "ties": int((abs(deltas) <= 1e-12).sum()),
+        "paired_bootstrap_95pct": np.quantile(samples, [.025, .975]).tolist(),
+    }
+
+
 def result_summary(rows, config):
     result = {"queries": len(rows), "config": config, "methods": {}}
     for method in rows[0]["methods"]:
-        records = [r["methods"][method] for r in rows]
-        item = {}
+        method_rows = [r["methods"][method] for r in rows]
+        method_summary = {}
         for key in ("candidate_recall@20", "oracle_recall@5", "candidate_recall"):
-            if key in records[0]:
-                item[key] = float(np.mean([r[key] for r in records]))
-        if "metrics" in records[0]:
-            item["metrics"] = {}
+            if key in method_rows[0]:
+                method_summary[key] = float(np.mean([r[key] for r in method_rows]))
+        if "metrics" in method_rows[0]:
+            method_summary["metrics"] = {}
             for key in ("Recall@5", "Recall@10", "MRR@10"):
-                values = [r["metrics"].get(key) for r in records]
-                item["metrics"][key] = None if any(v is None for v in values) else float(np.mean(values))
+                values = [r["metrics"].get(key) for r in method_rows]
+                method_summary["metrics"][key] = None if any(v is None for v in values) else float(np.mean(values))
             for control in ("dense", "cross"):
                 if control not in rows[0]["methods"]:
                     continue
@@ -260,20 +293,16 @@ def result_summary(rows, config):
                 for key in ("Recall@5", "Recall@10"):
                     deltas = np.asarray([r["methods"][method]["metrics"][key] -
                                          r["methods"][control]["metrics"][key] for r in rows])
-                    rng = np.random.default_rng(17)
-                    samples = rng.choice(deltas, (2000, len(deltas)), replace=True).mean(axis=1)
-                    paired[key] = {"mean_delta": float(deltas.mean()), "wins": int((deltas > 1e-12).sum()),
-                                   "losses": int((deltas < -1e-12).sum()), "ties": int((abs(deltas) <= 1e-12).sum()),
-                                   "paired_bootstrap_95pct": np.quantile(samples, [.025, .975]).tolist()}
-                item["paired_vs_" + control] = paired
-        if "api" in records[0]:
-            item["api"] = {key: sum(r["api"][key] for r in records)
+                    paired[key] = paired_comparison(deltas)
+                method_summary["paired_vs_" + control] = paired
+        if "api" in method_rows[0]:
+            method_summary["api"] = {key: sum(r["api"][key] for r in method_rows)
                            for key in ("requests", "cache_hits", "logical_pair_scores", "invalid_outputs", "prompt_chars")}
-            item["median_measured_path_ms"] = float(np.median([r["path_ms"] for r in records]))
+            method_summary["median_measured_path_ms"] = float(np.median([r["path_ms"] for r in method_rows]))
         for key in ("gained_relevant_ids", "lost_relevant_ids"):
-            if key in records[0]:
-                item[key.replace("_ids", "_count")] = sum(len(r[key]) for r in records)
-        result["methods"][method] = item
+            if key in method_rows[0]:
+                method_summary[key.replace("_ids", "_count")] = sum(len(r[key]) for r in method_rows)
+        result["methods"][method] = method_summary
     if "call_pointwise" in rows[0]:
         count = sum(r["call_pointwise"] for r in rows)
         result.update({"selected_queries": count, "selected_fraction": count / len(rows),
