@@ -150,6 +150,38 @@ NDCG@10. The transcript cache stores outputs produced by ASR. Reuse the same
 transcripts to compare downstream variants, and record this choice in your
 experiment. Use a new cache when comparing ASR implementations.
 
+To diagnose retrieval errors without generating answers or calling ELM, reuse
+that cache:
+
+```bash
+python rag/scripts/diagnose_retrieval.py --device cpu --split practice --transcript-cache rag/.cache/practice_transcripts.jsonl --cache-only --out-dir rag/results/practice_diagnostics
+```
+
+With a complete cache, this diagnostic run needs no GPU. Without `--cache-only`,
+missing transcripts are produced by ASR, requiring the usual GPU setup. Reuse
+the cache from the experiment you are diagnosing; cached transcripts do not
+identify which ASR settings produced them. Choose a new output directory for
+each run.
+
+The script writes `queries.jsonl` with every query's transcript, metrics,
+ranked records, scores and full document texts; `r10_candidates.jsonl` filters
+this to Recall@10 < 1. `queries.csv` contains sortable metrics and flags,
+`summary.json` contains aggregate results, and `report.md` shows the 20 lowest
+Recall@5 flagged queries (adjust with `--report-limit`). Recall@5 < 1 is flagged
+separately, including queries with perfect Recall@10. Some queries have more
+than five relevant records, making perfect Recall@5 impossible.
+
+The diagnostic reports the best Recall@5 achievable by reordering the candidate
+pool, accounting for the five-document limit. Its gap above current Recall@5
+measures potential reranking headroom; a gap below the theoretical Recall@5
+ceiling indicates candidate-coverage headroom. These are upper bounds based on
+public qrels, not predicted improvements. Relevant documents outside the pool
+have a null rank. The default pool has 100 records; change it with `--k-max`.
+
+For dense-preserving feature fusion, selective pointwise gating and deeper
+shortlist selection, follow the [experiments 1–3 guide](extensions/RETRIEVAL_FOLLOWUPS.md).
+It provides cached-score pilots, GPU replay commands and explicit ELM call budgets.
+
 ## Step 6: generate and evaluate answers
 
 Begin with five queries so you can inspect the outputs before evaluating a
