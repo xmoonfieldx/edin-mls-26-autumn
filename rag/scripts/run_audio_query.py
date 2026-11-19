@@ -1,5 +1,7 @@
 from pathlib import Path
 import sys
+import faulthandler
+
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -26,6 +28,7 @@ def main():
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
+    faulthandler.dump_traceback_later(60, repeat=True)
     if args.k < 1:
         ap.error("--k must be positive")
 
