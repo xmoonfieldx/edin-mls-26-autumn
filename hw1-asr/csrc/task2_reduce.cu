@@ -27,7 +27,7 @@ __global__ void layernorm_kernel(const float* x, const float* weight, const floa
   for (int c = threadIdx.x; c < cols; c += blockDim.x) {
     float d = xr[c] - mean;
     sq += d * d;
-  }
+  } //block stride loop
   const float rstd = rsqrtf(block_reduce_sum(sq) / cols + eps);  // 1 / sqrt(var + eps)
 
   for (int c = threadIdx.x; c < cols; c += blockDim.x)  // 3. normalise and write
@@ -43,6 +43,18 @@ __global__ void rmsnorm_kernel(const float* x, const float* weight, float* y, in
   // ======================== BLANK 2.5 =========================
   // RMSNorm of this row: y = x / sqrt(mean(x^2) + eps) * weight.
   // YOUR CODE HERE
+
+  float sq = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x){
+      sq += xr[c] * xr[c];
+  } //step 
+  const float total = block_reduce_sum(sq);
+  const float mean = (total)/cols;
+  const float rstd = rsqrtf(mean + eps);
+
+  for (int c = threadIdx.x; c < cols; c += blockDim.x){
+      yr[c] = xr[c] * rstd * weight[c];
+  }
   // ============================================================
 }
 
@@ -59,11 +71,55 @@ __global__ void softmax_kernel(const float* x, float* y, int cols) {
   // Pass 1: set row_max and row_sum (the sum of exp(x - row_max) over the row),
   // reading x only once, with MaxSum.
   // YOUR CODE HERE
-  // ============================================================
+  MaxSum local = {-INFINITY, 0.0f};
+  //thread process
+  for (int c = threadIdx.x; c < cols; c += blockDim.x){
+    MaxSum current = {xr[c], 1.0f};
+    local = maxsum_merge(local, current);
+  }
+  //wrap process/reduction
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2){
+    MaxSum sm;
+    sm.m = __shfl_xor_sync(FULL_MASK, local.m, offset);
+    sm.l = __shfl_xor_sync(FULL_MASK, local.l, offset);
+    local = maxsum_merge(local, sm);
+  }
 
+  __shared__ MaxSum partial[WARP_SIZE];
+
+  const int lane = threadIdx.x % WARP_SIZE;
+  const int warp = threadIdx.x / WARP_SIZE;
+  const int num_warps = blockDim.x / WARP_SIZE;
+  if (lane == 0) {
+    partial[warp] = local;
+  }
+  __syncthreads();
+
+  local = (lane < num_warps) ? partial[lane] : MaxSum{-INFINITY, 0.0f};
+
+  for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+    MaxSum other;
+
+    other.m = __shfl_xor_sync(FULL_MASK, local.m, offset);
+    other.l = __shfl_xor_sync(FULL_MASK, local.l, offset);
+
+    local = maxsum_merge(local, other);
+  }
+
+  __syncthreads();
+
+  row_max = local.m;
+  row_sum = local.l;
+
+
+  // ============================================================
+      
   // ======================== BLANK 2.7 =========================
   // Pass 2: y = exp(x - row_max) / row_sum.
   // YOUR CODE HERE
+  for (int c = threadIdx.x; c < cols; c+= blockDim.x){
+    yr[c] = expf(xr[c] - row_max) / row_sum;
+  }
   // ============================================================
 }
 
